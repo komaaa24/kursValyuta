@@ -1,0 +1,36 @@
+{
+  "name": "valyutakursi",
+  "version": "1.0.0",
+  "description": "Telegram bot for currency rates using grammy + TypeORM",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "grammy",
+    "currency",
+    "typeorm"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node-fetch": "^2.6.13",
+    "dotenv": "^17.2.3",
+    "grammy": "^1.39.2",
+    "node-fetch": "^2.7.0",
+    "pg": "^8.16.3",
+    "reflect-metadata": "^0.2.2",
+    "typeorm": "^0.3.28"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.6",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  }
+}
