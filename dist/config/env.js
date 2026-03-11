@@ -32,9 +32,24 @@ const parseNumberList = (value) => {
         .map((item) => Number(item.trim()))
         .filter((item) => Number.isFinite(item));
 };
+const parseList = (value) => {
+    if (!value)
+        return [];
+    return value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+};
 const clickServiceId = optionalEnv("CLICK_SERVICE_ID");
 const clickMerchantId = optionalEnv("CLICK_MERCHANT_ID");
 const clickSecretKey = optionalEnv("CLICK_SECRET_KEY");
+const clickReturnUrl = optionalEnv("CLICK_RETURN_URL");
+const clickReturnUrlAllowlist = Array.from(new Set([...parseList(process.env.CLICK_RETURN_URL_WHITELIST), ...(clickReturnUrl ? [clickReturnUrl] : [])]));
+const clickIpAllowlist = parseList(process.env.CLICK_IP_ALLOWLIST);
+const appBaseUrl = optionalEnv("APP_BASE_URL");
+const paymentTtlMinutes = numberEnv(process.env.PAYMENT_TTL_MINUTES ?? "20", 20);
+const paymentLinkModeRaw = optionalEnv("PAYMENT_LINK_MODE")?.toLowerCase();
+const legacyWebhookToken = optionalEnv("LEGACY_WEBHOOK_TOKEN") ?? optionalEnv("PAYMENT_WEBHOOK_TOKEN");
 const dbHost = requireEnv("DB_HOST");
 const dbPort = Number(requireEnv("DB_PORT"));
 const dbUsername = requireEnv("DB_USERNAME");
@@ -61,7 +76,7 @@ exports.env = {
         password: sherlarDbPassword,
         database: sherlarDbName,
     },
-    rateApiUrl: process.env.RATE_API_URL ?? "http://94.158.51.173:8080/kurs/kurs.php",
+    rateApiUrl: process.env.RATE_API_URL ?? "http://94.158.52.192/kurs/test.php",
     proPaymentUrl: process.env.PRO_PAYMENT_URL ?? "http://94.158.52.192/kurs/test.php",
     proBanksUrl: process.env.PRO_BANKS_URL ?? "http://94.158.52.192/kurs/test.php",
     proPrice: Number(process.env.PRO_PRICE ?? 1111),
@@ -70,10 +85,22 @@ exports.env = {
         serviceId: clickServiceId,
         merchantId: clickMerchantId,
         secretKey: clickSecretKey,
-        returnUrl: optionalEnv("CLICK_RETURN_URL"),
+        returnUrl: clickReturnUrl,
+        returnUrlAllowlist: clickReturnUrlAllowlist,
+        ipAllowlist: clickIpAllowlist,
         baseUrl: optionalEnv("CLICK_BASE_URL") ?? "https://my.click.uz/services/pay",
         enabled: Boolean(clickServiceId && clickMerchantId && clickSecretKey),
     },
+    appBaseUrl,
+    paymentTtlMinutes,
+    legacyWebhookToken,
+    paymentLinkMode: paymentLinkModeRaw === "legacy"
+        ? "legacy"
+        : paymentLinkModeRaw === "tx-only"
+            ? "tx-only"
+            : appBaseUrl && clickServiceId && clickMerchantId && clickSecretKey
+                ? "tx-only"
+                : "legacy",
     adminIds: parseNumberList(process.env.ADMIN_IDS ?? process.env.OPERATOR_CHAT_ID),
     webhookPort: numberEnv(process.env.WEBHOOK_PORT ?? process.env.PORT ?? "3000", 3000),
     alertCheckIntervalMs: numberEnv(process.env.ALERT_CHECK_INTERVAL_MS ?? "300000", 300000),

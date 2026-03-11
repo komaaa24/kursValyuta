@@ -46,6 +46,10 @@ __decorate([
     __metadata("design:type", Date)
 ], Payment.prototype, "appliedAt", void 0);
 __decorate([
+    (0, typeorm_1.Column)({ type: "timestamp with time zone", nullable: true }),
+    __metadata("design:type", Object)
+], Payment.prototype, "expiresAt", void 0);
+__decorate([
     (0, typeorm_1.Column)({ type: "jsonb", nullable: true }),
     __metadata("design:type", Object)
 ], Payment.prototype, "metadata", void 0);

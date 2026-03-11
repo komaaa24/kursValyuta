@@ -4,7 +4,13 @@ import { Repository } from "typeorm";
 import { env } from "../config/env";
 import { Payment, PaymentStatus } from "../entities/Payment";
 import { User } from "../entities/User";
-import { generateClickResponseSignature, verifyClickSignature } from "../services/clickService";
+import {
+  generateClickPaymentLink,
+  generateClickResponseSignature,
+  normalizeReturnUrl,
+  normalizeReturnUrlList,
+  verifyClickSignature,
+} from "../services/clickService";
 import { applyProPayment } from "../services/proService";
 
 type WebhookDeps = {
@@ -33,6 +39,10 @@ type PaymentMetadata = Record<string, unknown> & {
   clickReceivedAt?: string;
   revokedAt?: string;
   revokedSkipAt?: string;
+  returnUrl?: string | null;
+  redirectedAt?: string;
+  expiredAt?: string;
+  expiredReason?: string;
 };
 
 const readBody = (req: IncomingMessage): Promise<string> =>
@@ -92,12 +102,80 @@ const parseClickError = (value: string): number => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+const normalizedReturnUrlAllowlist = normalizeReturnUrlList(env.click.returnUrlAllowlist);
+const normalizedClickIpAllowlist = env.click.ipAllowlist.map((value) => (value.startsWith("::ffff:") ? value.slice(7) : value));
+
+const extractBearerToken = (value: string | undefined): string | null => {
+  if (!value) return null;
+  const [scheme, token] = value.split(" ");
+  if (!scheme || !token) return null;
+  if (scheme.toLowerCase() !== "bearer") return null;
+  return token.trim() || null;
+};
+
+const extractLegacyWebhookToken = (req: IncomingMessage): string | null => {
+  const headerToken = req.headers["x-webhook-token"] ?? req.headers["x-api-key"];
+  if (typeof headerToken === "string" && headerToken.trim()) return headerToken.trim();
+  const bearer = extractBearerToken(typeof req.headers.authorization === "string" ? req.headers.authorization : undefined);
+  return bearer;
+};
+
+const requireLegacyWebhookAuth = (req: IncomingMessage, res: ServerResponse): boolean => {
+  if (!env.legacyWebhookToken) {
+    console.error("[WEBHOOK] LEGACY_WEBHOOK_TOKEN not configured");
+    sendJson(res, 503, { error: "Webhook auth not configured" });
+    return false;
+  }
+  const provided = extractLegacyWebhookToken(req);
+  if (!provided || provided !== env.legacyWebhookToken) {
+    sendJson(res, 401, { error: "Unauthorized" });
+    return false;
+  }
+  return true;
+};
+
+const getRemoteIps = (req: IncomingMessage): string[] => {
+  const forwarded = req.headers["x-forwarded-for"];
+  const rawList = typeof forwarded === "string" ? forwarded.split(",") : Array.isArray(forwarded) ? forwarded : [];
+  if (req.socket.remoteAddress) rawList.push(req.socket.remoteAddress);
+  return rawList.map((item) => {
+    const trimmed = item.trim();
+    return trimmed.startsWith("::ffff:") ? trimmed.slice(7) : trimmed;
+  });
+};
+
+const isClickIpAllowed = (req: IncomingMessage): boolean => {
+  if (!normalizedClickIpAllowlist.length) return true;
+  const remoteIps = getRemoteIps(req);
+  return remoteIps.some((ip) => normalizedClickIpAllowlist.includes(ip));
+};
+
+const isPaymentExpired = (payment: Payment, now: Date = new Date()): boolean => {
+  if (!payment.expiresAt) return false;
+  return payment.expiresAt.getTime() <= now.getTime();
+};
+
+const markPaymentExpired = async (payment: Payment, metadata: PaymentMetadata, deps: WebhookDeps, reason: string): Promise<void> => {
+  payment.status = PaymentStatus.FAILED;
+  payment.metadata = {
+    ...(payment.metadata ?? {}),
+    ...metadata,
+    expiredAt: new Date().toISOString(),
+    expiredReason: reason,
+  };
+  await deps.paymentRepository.save(payment);
+};
+
 const finalizePayment = async (
   payment: Payment,
   metadata: PaymentMetadata,
   deps: WebhookDeps,
   telegramIdOverride?: number | null,
-): Promise<{ applied: boolean; telegramId: number | null }> => {
+): Promise<{ applied: boolean; telegramId: number | null; reason?: string }> => {
+  if (payment.status === PaymentStatus.PENDING && isPaymentExpired(payment)) {
+    await markPaymentExpired(payment, metadata, deps, "ttl");
+    return { applied: false, telegramId: payment.telegramId || telegramIdOverride || null, reason: "expired" };
+  }
   if (payment.status !== PaymentStatus.PAID) {
     payment.status = PaymentStatus.PAID;
   }
@@ -164,18 +242,38 @@ const handlePaymentWebhook = async (req: IncomingMessage, res: ServerResponse, d
   const rawBody = await readBody(req);
   const body = parseBody(req, rawBody);
 
+  if (!requireLegacyWebhookAuth(req, res)) {
+    return;
+  }
+
   const tx = String(body.tx ?? "");
   const status = String(body.status ?? "");
-  const amount = body.amount ?? null;
+  const amountRaw = body.amount ?? null;
   const userIdRaw = body.user_id ?? body.userId ?? null;
   const userId = Number(userIdRaw);
+  const amountValue = Number(amountRaw);
 
   if (!tx) {
     sendJson(res, 400, { error: "transaction_param required" });
     return;
   }
 
-  console.log("[WEBHOOK] /webhook/pay", { tx, status, amount, userId: userIdRaw });
+  if (amountRaw === null || amountRaw === undefined || amountRaw === "") {
+    sendJson(res, 400, { error: "amount required" });
+    return;
+  }
+
+  if (!Number.isFinite(amountValue)) {
+    sendJson(res, 400, { error: "Invalid amount" });
+    return;
+  }
+
+  if (!Number.isFinite(userId)) {
+    sendJson(res, 400, { error: "user_id required" });
+    return;
+  }
+
+  console.log("[WEBHOOK] /webhook/pay", { tx, status, amount: amountValue, userId: userIdRaw });
 
   const payment = await deps.paymentRepository.findOne({ where: { transactionParam: tx } });
   if (!payment) {
@@ -184,18 +282,32 @@ const handlePaymentWebhook = async (req: IncomingMessage, res: ServerResponse, d
     return;
   }
 
+  if (amountValue !== payment.amount) {
+    console.error("[WEBHOOK] amount mismatch", { tx, expected: payment.amount, received: amountValue });
+    sendJson(res, 400, { error: "Invalid amount" });
+    return;
+  }
+
+  if (payment.telegramId !== userId) {
+    console.error("[WEBHOOK] user_id mismatch", { tx, expected: payment.telegramId, received: userId });
+    sendJson(res, 400, { error: "Invalid user_id" });
+    return;
+  }
+
   const paymentSuccess = status === "success" || status === "paid" || status === "completed";
   const metadata: PaymentMetadata = {
     ...(payment.metadata ?? {}),
     webhookStatus: status || null,
-    webhookAmount: amount,
-    webhookUserId: Number.isFinite(userId) ? userId : userIdRaw,
+    webhookAmount: amountValue,
+    webhookUserId: userId,
     webhookReceivedAt: new Date().toISOString(),
   };
 
   if (paymentSuccess) {
     const result = await finalizePayment(payment, metadata, deps, Number.isFinite(userId) ? userId : null);
-    sendJson(res, 200, { success: true, message: result.applied ? "Payment completed" : "Payment recorded" });
+    const message =
+      result.reason === "expired" ? "Payment expired" : result.applied ? "Payment completed" : "Payment recorded";
+    sendJson(res, 200, { success: result.reason !== "expired", message });
     return;
   }
 
@@ -266,6 +378,18 @@ const handleClickPrepare = async (
       merchant_prepare_id: null,
       error: -2,
       error_note: "INVALID_AMOUNT: Incorrect amount",
+    });
+    return;
+  }
+
+  if (payment.status === PaymentStatus.PENDING && isPaymentExpired(payment)) {
+    await markPaymentExpired(payment, {}, deps, "ttl");
+    sendJson(res, 200, {
+      click_trans_id: clickTransId,
+      merchant_trans_id: merchantTransId,
+      merchant_prepare_id: payment.id,
+      error: -9,
+      error_note: "Transaction cancelled",
     });
     return;
   }
@@ -396,6 +520,18 @@ const handleClickComplete = async (
     return;
   }
 
+  const amountValue = Number(amount);
+  if (!Number.isFinite(amountValue) || amountValue !== payment.amount) {
+    sendJson(res, 200, {
+      click_trans_id: clickTransId,
+      merchant_trans_id: merchantTransId,
+      merchant_prepare_id: merchantPrepareIdRaw || null,
+      error: -2,
+      error_note: "INVALID_AMOUNT: Incorrect amount",
+    });
+    return;
+  }
+
   const baseMetadata: PaymentMetadata = {
     ...(payment.metadata ?? {}),
     clickTransId,
@@ -407,6 +543,18 @@ const handleClickComplete = async (
     clickSignTime: signTime,
     clickReceivedAt: new Date().toISOString(),
   };
+
+  if (payment.status === PaymentStatus.PENDING && isPaymentExpired(payment)) {
+    await markPaymentExpired(payment, baseMetadata, deps, "ttl");
+    sendJson(res, 200, {
+      click_trans_id: clickTransId,
+      merchant_trans_id: merchantTransId,
+      merchant_prepare_id: merchantPrepareIdRaw || null,
+      error: -9,
+      error_note: "Transaction cancelled",
+    });
+    return;
+  }
 
   if (clickErrorCode !== 0) {
     payment.status = PaymentStatus.FAILED;
@@ -486,6 +634,11 @@ const handleClickWebhook = async (req: IncomingMessage, res: ServerResponse, dep
     return;
   }
 
+  if (!isClickIpAllowed(req)) {
+    sendJson(res, 403, { error: -1, error_note: "IP not allowed" });
+    return;
+  }
+
   const rawBody = await readBody(req);
   const body = parseBody(req, rawBody);
   const action = coerceString(body.action);
@@ -503,6 +656,81 @@ const handleClickWebhook = async (req: IncomingMessage, res: ServerResponse, dep
   sendJson(res, 400, { error: -3, error_note: "Unknown action" });
 };
 
+const handlePayRedirect = async (req: IncomingMessage, res: ServerResponse, deps: WebhookDeps): Promise<void> => {
+  if (!env.click.enabled) {
+    sendJson(res, 503, { error: "Click not configured" });
+    return;
+  }
+
+  if (env.paymentLinkMode !== "tx-only") {
+    sendJson(res, 404, { error: "Not found" });
+    return;
+  }
+
+  if (!env.appBaseUrl) {
+    sendJson(res, 503, { error: "APP_BASE_URL not configured" });
+    return;
+  }
+
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const tx = url.searchParams.get("tx")?.trim();
+  if (!tx) {
+    sendJson(res, 400, { error: "tx required" });
+    return;
+  }
+
+  const payment = await deps.paymentRepository.findOne({ where: { transactionParam: tx } });
+  if (!payment) {
+    sendJson(res, 404, { error: "Payment not found" });
+    return;
+  }
+
+  if (payment.status !== PaymentStatus.PENDING) {
+    sendJson(res, 409, { error: "Payment already processed" });
+    return;
+  }
+
+  if (isPaymentExpired(payment)) {
+    await markPaymentExpired(payment, {}, deps, "ttl");
+    sendJson(res, 410, { error: "Payment expired" });
+    return;
+  }
+
+  const returnUrlRaw = payment.metadata && typeof payment.metadata === "object" ? (payment.metadata as Record<string, unknown>).returnUrl : null;
+  const returnUrl = typeof returnUrlRaw === "string" ? normalizeReturnUrl(returnUrlRaw) : null;
+  if (!returnUrl || !normalizedReturnUrlAllowlist.includes(returnUrl)) {
+    sendJson(res, 400, { error: "Invalid return_url" });
+    return;
+  }
+
+  const serviceId = env.click.serviceId;
+  const merchantId = env.click.merchantId;
+  if (!serviceId || !merchantId) {
+    sendJson(res, 503, { error: "Click merchant not configured" });
+    return;
+  }
+
+  const { url: clickUrl } = generateClickPaymentLink({
+    baseUrl: env.click.baseUrl,
+    serviceId,
+    merchantId,
+    amount: payment.amount,
+    transactionParam: tx,
+    returnUrl,
+  });
+
+  payment.metadata = {
+    ...(payment.metadata ?? {}),
+    returnUrl,
+    redirectedAt: new Date().toISOString(),
+  };
+  await deps.paymentRepository.save(payment);
+
+  res.statusCode = 302;
+  res.setHeader("Location", clickUrl);
+  res.end();
+};
+
 export const startWebhookServer = (port: number, deps: WebhookDeps): Server => {
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
@@ -510,6 +738,16 @@ export const startWebhookServer = (port: number, deps: WebhookDeps): Server => {
 
     if (method === "GET" && url.pathname === "/health") {
       sendJson(res, 200, { status: "ok", timestamp: new Date().toISOString() });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/pay") {
+      try {
+        await handlePayRedirect(req, res, deps);
+      } catch (error) {
+        console.error("Pay redirect error", error);
+        sendJson(res, 500, { error: "Internal server error" });
+      }
       return;
     }
 

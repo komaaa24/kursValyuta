@@ -24,9 +24,15 @@ export declare const env: {
         merchantId: string | undefined;
         secretKey: string | undefined;
         returnUrl: string | undefined;
+        returnUrlAllowlist: string[];
+        ipAllowlist: string[];
         baseUrl: string;
         enabled: boolean;
     };
+    appBaseUrl: string | undefined;
+    paymentTtlMinutes: number;
+    legacyWebhookToken: string | undefined;
+    paymentLinkMode: string;
     adminIds: number[];
     webhookPort: number;
     alertCheckIntervalMs: number;

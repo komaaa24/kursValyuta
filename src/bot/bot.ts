@@ -8,7 +8,7 @@ import { User } from "../entities/User";
 import { CurrencyService } from "../services/currencyService";
 import { applyProPayment } from "../services/proService";
 import { SherlarPaymentService } from "../services/sherlarPaymentService";
-import { generateClickPaymentLink, generateTransactionParam } from "../services/clickService";
+import { generateTransactionParam, normalizeReturnUrl, normalizeReturnUrlList } from "../services/clickService";
 
 type Dependencies = {
   userRepository: Repository<User>;
@@ -51,11 +51,11 @@ type BankRateKind = "buy" | "sell";
 
 const formatHelp = (): string =>
   [
-    "💱 Valyuta kursi botiga xush kelibsiz!",
-    "▫️ Konvertatsiya — yo'nalishni tanlang (USD ↔ UZS), miqdorni kiriting, natijani oling.",
-    "▫️ Kurslar — mashhur juftliklar bo'yicha bugungi kurs.",
-    "▫️ Kursni kuzatish — PRO uchun narx triggerlari (USD/EUR va boshqalar).",
-    "▫️ Tugmalar orqali boshqariladi. Savollar uchun \"Yordam\" ni bosing.",
+    "💱 Valyuta olamiga xush kelibsiz!",
+    "▫️ Konvertatsiya: USD ↔️ UZS yo'nalishini tanlang, miqdorni kiriting va natijani bir zumda oling.",
+    "▫️ Kurslar: mashhur valyutalar bo'yicha eng so'nggi kurslarni ko'ring.",
+    "▫️ Kursni kuzatish: PRO rejimda USD/EUR va boshqa valyutalarga narx alert qo'ying.",
+    "▫️ Hammasi qulay tugmalar orqali ishlaydi. Qo'llanma uchun \"Yordam\" ni bosing.",
   ].join("\n");
 
 const homeKeyboard = (): InlineKeyboard =>
@@ -157,6 +157,8 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
   const sherlarPaymentService = new SherlarPaymentService();
   let alertCheckRunning = false;
   const adminIds = env.adminIds;
+  const normalizedReturnUrlAllowlist = normalizeReturnUrlList(env.click.returnUrlAllowlist);
+  const paymentTtlMinutes = Number.isFinite(env.paymentTtlMinutes) && env.paymentTtlMinutes > 0 ? env.paymentTtlMinutes : 20;
 
   const getUserByTelegramId = async (telegramId?: number): Promise<User | null> => {
     if (!telegramId) return null;
@@ -189,6 +191,15 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
     if (isAdmin(ctx.from?.id)) return true;
     await ctx.reply("⛔️ Bu buyruq faqat admin uchun!");
     return false;
+  };
+
+  const resolveReturnUrl = (botUsername?: string): string | null => {
+    const candidate = env.click.returnUrl ?? (botUsername ? `https://t.me/${botUsername}` : undefined);
+    if (!candidate) return null;
+    const normalized = normalizeReturnUrl(candidate);
+    if (!normalized) return null;
+    if (!normalizedReturnUrlAllowlist.length) return null;
+    return normalizedReturnUrlAllowlist.includes(normalized) ? normalized : null;
   };
 
   const addProPaymentButtons = (keyboard: InlineKeyboard, payment?: ProPaymentDetails): InlineKeyboard => {
@@ -234,16 +245,33 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
       return { ok: false, message: "Foydalanuvchi aniqlanmadi. Qaytadan urinib ko'ring." };
     }
 
-    const { url, tx } = buildProPaymentLink(proPrice, userId, ctx.me?.username);
+    const returnUrl = env.click.enabled ? resolveReturnUrl(ctx.me?.username) : null;
+    if (env.paymentLinkMode === "tx-only") {
+      if (!env.click.enabled || !env.appBaseUrl || !returnUrl) {
+        return { ok: false, message: "To'lov tizimi sozlanmagan. Admin bilan bog'laning." };
+      }
+      try {
+        new URL(env.appBaseUrl);
+      } catch (error) {
+        console.error("Invalid APP_BASE_URL", error);
+        return { ok: false, message: "To'lov tizimi sozlanmagan. Admin bilan bog'laning." };
+      }
+    }
+
+    const tx = generateTransactionParam();
+    const expiresAt = new Date(Date.now() + paymentTtlMinutes * 60 * 1000);
+    const url = buildProPaymentLink(tx, proPrice, userId, returnUrl);
     const payment = deps.paymentRepository.create({
       transactionParam: tx,
       telegramId: userId,
       amount: proPrice,
       status: PaymentStatus.PENDING,
+      expiresAt,
       metadata: {
         username: ctx.from?.username ?? null,
         firstName: ctx.from?.first_name ?? null,
         lastName: ctx.from?.last_name ?? null,
+        returnUrl: returnUrl ?? null,
       },
     });
 
@@ -298,6 +326,19 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
     const user = await ensureUser(ctx);
     if (!user) {
       await ctx.reply("Foydalanuvchi aniqlanmadi. Qaytadan urinib ko'ring.");
+      return;
+    }
+
+    if (payment.status === PaymentStatus.PENDING && payment.expiresAt && payment.expiresAt.getTime() <= Date.now()) {
+      payment.status = PaymentStatus.FAILED;
+      payment.metadata = {
+        ...(payment.metadata ?? {}),
+        expiredAt: new Date().toISOString(),
+        expiredReason: "ttl",
+      };
+      await deps.paymentRepository.save(payment);
+      const message = "⏳ To'lov muddati tugagan. Iltimos yangi to'lov yarating.";
+      await safeEditMessageText(ctx, message, { reply_markup: buildProKeyboard() });
       return;
     }
 
@@ -667,7 +708,10 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
     intervalHandle.unref();
   }
 
-  const defaultCommands = [{ command: "start", description: "Botni ishga tushirish" }];
+  const defaultCommands = [
+    { command: "start", description: "Botni ishga tushirish" },
+    { command: "pay", description: "PRO uchun to'lov" },
+  ];
   void bot.api.setMyCommands(defaultCommands).catch((error) => console.error("Failed to set commands", error));
   if (adminIds.length) {
     const adminCommands = [
@@ -703,6 +747,26 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
     await ctx.reply(formatHelp(), { reply_markup: commandKeyboard });
   });
 
+  bot.command("pay", async (ctx) => {
+    const user = await ensureUser(ctx);
+    if (!user) {
+      await ctx.reply("Foydalanuvchi aniqlanmadi. Qaytadan urinib ko'ring.");
+      return;
+    }
+
+    if (isAdmin(ctx.from?.id)) {
+      const updatedUntil = await applyProPayment(deps.userRepository, user, 0);
+      const message = [
+        "✅ Admin uchun PRO faollashtirildi!",
+        `Muddati: cheksiz (taxminan ${formatDate(updatedUntil)} gacha).`,
+      ].join("\n");
+      await ctx.reply(message, { reply_markup: homeKeyboard() });
+      return;
+    }
+
+    await sendProOffer(ctx);
+  });
+
   bot.command("admin", async (ctx) => {
     const ok = await requireAdmin(ctx);
     if (!ok) return;
@@ -710,6 +774,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
       "👑 Admin panel",
       "",
       "Buyruqlar:",
+      "/pay — o'zingiz uchun PRO'ni faollashtirish",
       "/revoke TELEGRAM_ID — obunani bekor qilish",
     ].join("\n");
     await ctx.reply(text);
@@ -742,7 +807,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
     await ctx.reply(`✅ Obuna bekor qilindi: ${telegramId}`);
   });
 
-  // Slash komandalar o'chirildi: foydalanuvchilar tugmalar orqali ishlaydi.
+  // Asosiy oqim tugmalar orqali ishlaydi; /pay adminlar va xohlagan foydalanuvchi uchun qo'llab-quvvatlanadi.
 
   bot.on("message:text", async (ctx, next: NextFunction) => {
     const text = ctx.message?.text ?? "";
@@ -1309,39 +1374,28 @@ const proText = (price: number): string =>
     `Narx: ${price.toLocaleString("en-US")} so'm (bir martalik)`,
   ].join("\n");
 
-const buildProPaymentLink = (amount: number, userId?: number, botUsername?: string, baseUrl: string = env.proPaymentUrl): { url: string; tx: string } => {
-  const tx = generateTransactionParam();
-
-  if (env.click.enabled) {
-    const returnUrl = env.click.returnUrl ?? (botUsername ? `https://t.me/${botUsername}` : "");
-    const serviceId = env.click.serviceId;
-    const merchantId = env.click.merchantId;
-    if (returnUrl && serviceId && merchantId) {
-      const { url } = generateClickPaymentLink({
-        baseUrl: env.click.baseUrl,
-        serviceId,
-        merchantId,
-        amount,
-        transactionParam: tx,
-        returnUrl,
-      });
-      return { url, tx };
+const buildProPaymentLink = (tx: string, amount: number, userId?: number, returnUrl?: string | null, baseUrl: string = env.proPaymentUrl): string => {
+  if (env.paymentLinkMode === "tx-only" && env.click.enabled && env.appBaseUrl) {
+    try {
+      const url = new URL("/pay", env.appBaseUrl);
+      url.searchParams.set("tx", tx);
+      return url.toString();
+    } catch (error) {
+      console.error("Invalid APP_BASE_URL, falling back to PRO_PAYMENT_URL", error);
     }
-
-    console.error("CLICK_RETURN_URL missing and bot username unavailable; falling back to PRO_PAYMENT_URL");
   }
 
   const params = new URLSearchParams({ amount: String(amount), tx });
   if (userId) params.set("user_id", String(userId));
-  if (botUsername) params.set("return_url", `https://t.me/${botUsername}`);
+  if (returnUrl) params.set("return_url", returnUrl);
 
   try {
     const url = new URL(baseUrl);
     params.forEach((value, key) => url.searchParams.set(key, value));
-    return { url: url.toString(), tx };
+    return url.toString();
   } catch (error) {
     console.error("Invalid PRO_PAYMENT_URL, falling back to string concat", error);
     const separator = baseUrl.includes("?") ? "&" : "?";
-    return { url: `${baseUrl}${separator}${params.toString()}`, tx };
+    return `${baseUrl}${separator}${params.toString()}`;
   }
 };

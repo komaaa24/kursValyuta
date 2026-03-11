@@ -61,27 +61,48 @@ class CurrencyService {
         }
         const payload = (await response.json());
         const saved = [];
-        for (const item of payload) {
-            const cleanName = decodeHtml(item.name);
-            const match = cleanName.match(/^(\d+)\s+(.+)$/);
-            const amount = match ? Number(match[1]) : 1;
-            const labelRaw = match ? match[2] : cleanName;
-            const label = labelRaw.replace(/\s+/g, " ").trim();
-            const base = mapNameToCode(label);
-            if (!base) {
-                console.warn(`Unknown currency label skipped: ${label}`);
-                continue;
+        // Legacy endpoint: [{ name: "...", kurs: "..." }, ...]
+        if (Array.isArray(payload)) {
+            for (const item of payload) {
+                if (!item || typeof item !== "object")
+                    continue;
+                if (!("name" in item) || !("kurs" in item))
+                    continue;
+                const rawName = item.name;
+                const rawKurs = item.kurs;
+                if (typeof rawName !== "string")
+                    continue;
+                const cleanName = decodeHtml(rawName);
+                const match = cleanName.match(/^(\d+)\s+(.+)$/);
+                const amount = match ? Number(match[1]) : 1;
+                const labelRaw = match ? match[2] : cleanName;
+                const label = labelRaw.replace(/\s+/g, " ").trim();
+                const base = mapNameToCode(label);
+                if (!base) {
+                    console.warn(`Unknown currency label skipped: ${label}`);
+                    continue;
+                }
+                const numeric = parseRateNumber(rawKurs);
+                if (!Number.isFinite(numeric) || amount <= 0) {
+                    console.warn(`Invalid rate skipped for ${label} (${String(rawKurs)})`);
+                    continue;
+                }
+                const ratePerUnit = numeric / amount;
+                const stored = await this.upsertRate(base, quote, ratePerUnit.toFixed(6));
+                saved.push(stored);
             }
-            const numeric = Number(item.kurs.replace(/\s/g, ""));
-            if (!Number.isFinite(numeric) || amount <= 0) {
-                console.warn(`Invalid rate skipped for ${label} (${item.kurs})`);
-                continue;
+            if (saved.length > 0) {
+                return saved;
             }
-            const ratePerUnit = numeric / amount;
-            const stored = await this.upsertRate(base, quote, ratePerUnit.toFixed(6));
-            saved.push(stored);
         }
-        return saved;
+        // New endpoint: { buy: [{ rate }], sell: [{ rate }] } (usually USD/UZS bank rates)
+        const usdRate = extractUsdRateFromBankPayload(payload);
+        if (usdRate !== null) {
+            const stored = await this.upsertRate("USD", quote, usdRate.toFixed(6));
+            saved.push(stored);
+            return saved;
+        }
+        throw new Error("Unsupported rate API payload format");
     }
     async pullCbuRates(apiUrl = "https://cbu.uz/uz/arkhiv-kursov-valyut/json/") {
         const response = await (0, node_fetch_1.default)(apiUrl);
@@ -197,6 +218,46 @@ const decodeHtml = (value) => value
     .replace(/&#39;/g, "'")
     .replace(/&quot;/g, '"')
     .replace(/&amp;/g, "&");
+const parseRateNumber = (value) => {
+    if (typeof value === "number")
+        return value;
+    if (typeof value !== "string")
+        return Number.NaN;
+    const cleaned = value
+        .replace(/\s/g, "")
+        .replace(/[^\d,.-]/g, "")
+        .replace(",", ".");
+    return Number(cleaned);
+};
+const extractUsdRateFromBankPayload = (payload) => {
+    if (!payload || typeof payload !== "object")
+        return null;
+    const bag = payload;
+    const buyRates = parseBankSideRates(bag.buy);
+    const sellRates = parseBankSideRates(bag.sell);
+    if (buyRates.length && sellRates.length) {
+        const bestBuy = Math.max(...buyRates);
+        const bestSell = Math.min(...sellRates);
+        return (bestBuy + bestSell) / 2;
+    }
+    const allRates = [...buyRates, ...sellRates];
+    if (!allRates.length)
+        return null;
+    const sum = allRates.reduce((acc, current) => acc + current, 0);
+    return sum / allRates.length;
+};
+const parseBankSideRates = (entries) => {
+    if (!Array.isArray(entries))
+        return [];
+    return entries
+        .map((item) => {
+        if (!item || typeof item !== "object")
+            return Number.NaN;
+        const raw = item.rate ?? item.rate_text;
+        return parseRateNumber(raw);
+    })
+        .filter((value) => Number.isFinite(value));
+};
 const parseCbuDate = (value) => {
     const match = value?.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
     if (!match)

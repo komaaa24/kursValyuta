@@ -12,11 +12,11 @@ const proService_1 = require("../services/proService");
 const sherlarPaymentService_1 = require("../services/sherlarPaymentService");
 const clickService_1 = require("../services/clickService");
 const formatHelp = () => [
-    "💱 Valyuta kursi botiga xush kelibsiz!",
-    "▫️ Konvertatsiya — yo'nalishni tanlang (USD ↔ UZS), miqdorni kiriting, natijani oling.",
-    "▫️ Kurslar — mashhur juftliklar bo'yicha bugungi kurs.",
-    "▫️ Kursni kuzatish — PRO uchun narx triggerlari (USD/EUR va boshqalar).",
-    "▫️ Tugmalar orqali boshqariladi. Savollar uchun \"Yordam\" ni bosing.",
+    "💱 Valyuta olamiga xush kelibsiz!",
+    "▫️ Konvertatsiya: USD ↔️ UZS yo'nalishini tanlang, miqdorni kiriting va natijani bir zumda oling.",
+    "▫️ Kurslar: mashhur valyutalar bo'yicha eng so'nggi kurslarni ko'ring.",
+    "▫️ Kursni kuzatish: PRO rejimda USD/EUR va boshqa valyutalarga narx alert qo'ying.",
+    "▫️ Hammasi qulay tugmalar orqali ishlaydi. Qo'llanma uchun \"Yordam\" ni bosing.",
 ].join("\n");
 const homeKeyboard = () => new grammy_1.InlineKeyboard()
     .text("💱 Konvertatsiya", "menu:open:convert")
@@ -101,6 +101,8 @@ const createBot = (token, deps) => {
     const sherlarPaymentService = new sherlarPaymentService_1.SherlarPaymentService();
     let alertCheckRunning = false;
     const adminIds = env_1.env.adminIds;
+    const normalizedReturnUrlAllowlist = (0, clickService_1.normalizeReturnUrlList)(env_1.env.click.returnUrlAllowlist);
+    const paymentTtlMinutes = Number.isFinite(env_1.env.paymentTtlMinutes) && env_1.env.paymentTtlMinutes > 0 ? env_1.env.paymentTtlMinutes : 20;
     const getUserByTelegramId = async (telegramId) => {
         if (!telegramId)
             return null;
@@ -130,6 +132,17 @@ const createBot = (token, deps) => {
             return true;
         await ctx.reply("⛔️ Bu buyruq faqat admin uchun!");
         return false;
+    };
+    const resolveReturnUrl = (botUsername) => {
+        const candidate = env_1.env.click.returnUrl ?? (botUsername ? `https://t.me/${botUsername}` : undefined);
+        if (!candidate)
+            return null;
+        const normalized = (0, clickService_1.normalizeReturnUrl)(candidate);
+        if (!normalized)
+            return null;
+        if (!normalizedReturnUrlAllowlist.length)
+            return null;
+        return normalizedReturnUrlAllowlist.includes(normalized) ? normalized : null;
     };
     const addProPaymentButtons = (keyboard, payment) => {
         if (payment) {
@@ -166,16 +179,33 @@ const createBot = (token, deps) => {
         if (!user) {
             return { ok: false, message: "Foydalanuvchi aniqlanmadi. Qaytadan urinib ko'ring." };
         }
-        const { url, tx } = buildProPaymentLink(proPrice, userId, ctx.me?.username);
+        const returnUrl = env_1.env.click.enabled ? resolveReturnUrl(ctx.me?.username) : null;
+        if (env_1.env.paymentLinkMode === "tx-only") {
+            if (!env_1.env.click.enabled || !env_1.env.appBaseUrl || !returnUrl) {
+                return { ok: false, message: "To'lov tizimi sozlanmagan. Admin bilan bog'laning." };
+            }
+            try {
+                new URL(env_1.env.appBaseUrl);
+            }
+            catch (error) {
+                console.error("Invalid APP_BASE_URL", error);
+                return { ok: false, message: "To'lov tizimi sozlanmagan. Admin bilan bog'laning." };
+            }
+        }
+        const tx = (0, clickService_1.generateTransactionParam)();
+        const expiresAt = new Date(Date.now() + paymentTtlMinutes * 60 * 1000);
+        const url = buildProPaymentLink(tx, proPrice, userId, returnUrl);
         const payment = deps.paymentRepository.create({
             transactionParam: tx,
             telegramId: userId,
             amount: proPrice,
             status: Payment_1.PaymentStatus.PENDING,
+            expiresAt,
             metadata: {
                 username: ctx.from?.username ?? null,
                 firstName: ctx.from?.first_name ?? null,
                 lastName: ctx.from?.last_name ?? null,
+                returnUrl: returnUrl ?? null,
             },
         });
         try {
@@ -223,6 +253,18 @@ const createBot = (token, deps) => {
         const user = await ensureUser(ctx);
         if (!user) {
             await ctx.reply("Foydalanuvchi aniqlanmadi. Qaytadan urinib ko'ring.");
+            return;
+        }
+        if (payment.status === Payment_1.PaymentStatus.PENDING && payment.expiresAt && payment.expiresAt.getTime() <= Date.now()) {
+            payment.status = Payment_1.PaymentStatus.FAILED;
+            payment.metadata = {
+                ...(payment.metadata ?? {}),
+                expiredAt: new Date().toISOString(),
+                expiredReason: "ttl",
+            };
+            await deps.paymentRepository.save(payment);
+            const message = "⏳ To'lov muddati tugagan. Iltimos yangi to'lov yarating.";
+            await safeEditMessageText(ctx, message, { reply_markup: buildProKeyboard() });
             return;
         }
         if (payment.status === Payment_1.PaymentStatus.PENDING) {
@@ -568,7 +610,10 @@ const createBot = (token, deps) => {
         const intervalHandle = setInterval(runAlertCheck, alertCheckIntervalMs);
         intervalHandle.unref();
     }
-    const defaultCommands = [{ command: "start", description: "Botni ishga tushirish" }];
+    const defaultCommands = [
+        { command: "start", description: "Botni ishga tushirish" },
+        { command: "pay", description: "PRO uchun to'lov" },
+    ];
     void bot.api.setMyCommands(defaultCommands).catch((error) => console.error("Failed to set commands", error));
     if (adminIds.length) {
         const adminCommands = [
@@ -602,6 +647,23 @@ const createBot = (token, deps) => {
         await ctx.reply("🏠 Asosiy menyu", { reply_markup: homeKeyboard() });
         await ctx.reply(formatHelp(), { reply_markup: commandKeyboard });
     });
+    bot.command("pay", async (ctx) => {
+        const user = await ensureUser(ctx);
+        if (!user) {
+            await ctx.reply("Foydalanuvchi aniqlanmadi. Qaytadan urinib ko'ring.");
+            return;
+        }
+        if (isAdmin(ctx.from?.id)) {
+            const updatedUntil = await (0, proService_1.applyProPayment)(deps.userRepository, user, 0);
+            const message = [
+                "✅ Admin uchun PRO faollashtirildi!",
+                `Muddati: cheksiz (taxminan ${formatDate(updatedUntil)} gacha).`,
+            ].join("\n");
+            await ctx.reply(message, { reply_markup: homeKeyboard() });
+            return;
+        }
+        await sendProOffer(ctx);
+    });
     bot.command("admin", async (ctx) => {
         const ok = await requireAdmin(ctx);
         if (!ok)
@@ -610,6 +672,7 @@ const createBot = (token, deps) => {
             "👑 Admin panel",
             "",
             "Buyruqlar:",
+            "/pay — o'zingiz uchun PRO'ni faollashtirish",
             "/revoke TELEGRAM_ID — obunani bekor qilish",
         ].join("\n");
         await ctx.reply(text);
@@ -639,7 +702,7 @@ const createBot = (token, deps) => {
         await deps.userRepository.save(user);
         await ctx.reply(`✅ Obuna bekor qilindi: ${telegramId}`);
     });
-    // Slash komandalar o'chirildi: foydalanuvchilar tugmalar orqali ishlaydi.
+    // Asosiy oqim tugmalar orqali ishlaydi; /pay adminlar va xohlagan foydalanuvchi uchun qo'llab-quvvatlanadi.
     bot.on("message:text", async (ctx, next) => {
         const text = ctx.message?.text ?? "";
         const userId = ctx.from?.id;
@@ -1181,39 +1244,31 @@ const proText = (price) => [
     "🔓 Bir marta to'lov qiling — butun umr ^PRO^dan foydalaning. PRO valyuta ayrboshlashda har kunlik sizga eng qulay bo'lgan banklarni taqdim etadi ",
     `Narx: ${price.toLocaleString("en-US")} so'm (bir martalik)`,
 ].join("\n");
-const buildProPaymentLink = (amount, userId, botUsername, baseUrl = env_1.env.proPaymentUrl) => {
-    const tx = (0, clickService_1.generateTransactionParam)();
-    if (env_1.env.click.enabled) {
-        const returnUrl = env_1.env.click.returnUrl ?? (botUsername ? `https://t.me/${botUsername}` : "");
-        const serviceId = env_1.env.click.serviceId;
-        const merchantId = env_1.env.click.merchantId;
-        if (returnUrl && serviceId && merchantId) {
-            const { url } = (0, clickService_1.generateClickPaymentLink)({
-                baseUrl: env_1.env.click.baseUrl,
-                serviceId,
-                merchantId,
-                amount,
-                transactionParam: tx,
-                returnUrl,
-            });
-            return { url, tx };
+const buildProPaymentLink = (tx, amount, userId, returnUrl, baseUrl = env_1.env.proPaymentUrl) => {
+    if (env_1.env.paymentLinkMode === "tx-only" && env_1.env.click.enabled && env_1.env.appBaseUrl) {
+        try {
+            const url = new URL("/pay", env_1.env.appBaseUrl);
+            url.searchParams.set("tx", tx);
+            return url.toString();
         }
-        console.error("CLICK_RETURN_URL missing and bot username unavailable; falling back to PRO_PAYMENT_URL");
+        catch (error) {
+            console.error("Invalid APP_BASE_URL, falling back to PRO_PAYMENT_URL", error);
+        }
     }
     const params = new URLSearchParams({ amount: String(amount), tx });
     if (userId)
         params.set("user_id", String(userId));
-    if (botUsername)
-        params.set("return_url", `https://t.me/${botUsername}`);
+    if (returnUrl)
+        params.set("return_url", returnUrl);
     try {
         const url = new URL(baseUrl);
         params.forEach((value, key) => url.searchParams.set(key, value));
-        return { url: url.toString(), tx };
+        return url.toString();
     }
     catch (error) {
         console.error("Invalid PRO_PAYMENT_URL, falling back to string concat", error);
         const separator = baseUrl.includes("?") ? "&" : "?";
-        return { url: `${baseUrl}${separator}${params.toString()}`, tx };
+        return `${baseUrl}${separator}${params.toString()}`;
     }
 };
 //# sourceMappingURL=bot.js.map

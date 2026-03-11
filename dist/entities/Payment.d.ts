@@ -10,6 +10,7 @@ export declare class Payment {
     amount: number;
     status: PaymentStatus;
     appliedAt?: Date;
+    expiresAt?: Date | null;
     metadata?: Record<string, unknown>;
     createdAt: Date;
     updatedAt: Date;

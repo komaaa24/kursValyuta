@@ -53,4 +53,31 @@ export const generateClickResponseSignature = (
   signTime: string,
 ): string => md5(clickTransId + serviceId + secretKey + merchantTransId + merchantPrepareId + amount + action + signTime);
 
+export const normalizeReturnUrl = (value: string): string | null => {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    url.search = "";
+    const normalizedPath = url.pathname.replace(/\/+$/, "");
+    return `${url.origin}${normalizedPath}`;
+  } catch {
+    return null;
+  }
+};
+
+export const normalizeReturnUrlList = (values: string[]): string[] => {
+  const normalized = new Set<string>();
+  for (const value of values) {
+    const next = normalizeReturnUrl(value);
+    if (next) normalized.add(next);
+  }
+  return Array.from(normalized);
+};
+
+export const isReturnUrlAllowed = (candidate: string, allowlist: string[]): boolean => {
+  const normalizedCandidate = normalizeReturnUrl(candidate);
+  if (!normalizedCandidate) return false;
+  return allowlist.includes(normalizedCandidate);
+};
+
 const md5 = (text: string): string => crypto.createHash("md5").update(text).digest("hex");

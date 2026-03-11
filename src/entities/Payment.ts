@@ -27,6 +27,9 @@ export class Payment {
   @Column({ type: "timestamp with time zone", nullable: true })
   appliedAt?: Date;
 
+  @Column({ type: "timestamp with time zone", nullable: true })
+  expiresAt?: Date | null;
+
   @Column({ type: "jsonb", nullable: true })
   metadata?: Record<string, unknown>;
 
