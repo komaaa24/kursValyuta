@@ -2,18 +2,20 @@ import fetch from "node-fetch";
 import { Repository } from "typeorm";
 import { CurrencyRate } from "../entities/CurrencyRate";
 
+const DEFAULT_CBU_RATES_URL = "https://cbu.uz/uz/arkhiv-kursov-valyut/json/";
+
 export class CurrencyService {
   constructor(private readonly repository: Repository<CurrencyRate>) {}
 
-  async upsertRate(base: string, quote: string, rate: string, updatedAt?: Date): Promise<CurrencyRate> {
+  async upsertRate(base: string, quote: string, rate: string, sourceDate?: Date): Promise<CurrencyRate> {
     const existing = await this.repository.findOne({ where: { base, quote } });
     if (existing) {
       existing.rate = rate;
-      if (updatedAt) existing.updatedAt = updatedAt;
+      existing.sourceDate = sourceDate ?? null;
       return this.repository.save(existing);
     }
 
-    const record = this.repository.create({ base, quote, rate, ...(updatedAt ? { updatedAt } : {}) });
+    const record = this.repository.create({ base, quote, rate, sourceDate: sourceDate ?? null });
     return this.repository.save(record);
   }
 
@@ -56,6 +58,21 @@ export class CurrencyService {
     return amount * rate;
   }
 
+  async syncRates(primaryApiUrl?: string): Promise<CurrencyRate[]> {
+    const candidates = Array.from(new Set([DEFAULT_CBU_RATES_URL, primaryApiUrl].filter((value): value is string => Boolean(value?.trim()))));
+    const errors: Error[] = [];
+
+    for (const apiUrl of candidates) {
+      try {
+        return await this.pullLatestRates(apiUrl);
+      } catch (error) {
+        errors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+
+    throw errors[0] ?? new Error("No rate source configured");
+  }
+
   async pullLatestRates(apiUrl: string, quote: string = "UZS"): Promise<CurrencyRate[]> {
     const response = await fetch(apiUrl);
     if (!response.ok) {
@@ -65,42 +82,12 @@ export class CurrencyService {
     const payload = (await response.json()) as unknown;
     const saved: CurrencyRate[] = [];
 
-    // Legacy endpoint: [{ name: "...", kurs: "..." }, ...]
     if (Array.isArray(payload)) {
-      for (const item of payload) {
-        if (!item || typeof item !== "object") continue;
-        if (!("name" in item) || !("kurs" in item)) continue;
+      const cbuSaved = await this.saveCbuPayload(payload);
+      if (cbuSaved.length > 0) return cbuSaved;
 
-        const rawName = (item as { name?: unknown }).name;
-        const rawKurs = (item as { kurs?: unknown }).kurs;
-        if (typeof rawName !== "string") continue;
-
-        const cleanName = decodeHtml(rawName);
-        const match = cleanName.match(/^(\d+)\s+(.+)$/);
-        const amount = match ? Number(match[1]) : 1;
-        const labelRaw = match ? match[2] : cleanName;
-        const label = labelRaw.replace(/\s+/g, " ").trim();
-
-        const base = mapNameToCode(label);
-        if (!base) {
-          console.warn(`Unknown currency label skipped: ${label}`);
-          continue;
-        }
-
-        const numeric = parseRateNumber(rawKurs);
-        if (!Number.isFinite(numeric) || amount <= 0) {
-          console.warn(`Invalid rate skipped for ${label} (${String(rawKurs)})`);
-          continue;
-        }
-
-        const ratePerUnit = numeric / amount;
-        const stored = await this.upsertRate(base, quote, ratePerUnit.toFixed(6));
-        saved.push(stored);
-      }
-
-      if (saved.length > 0) {
-        return saved;
-      }
+      const legacySaved = await this.saveLegacyPayload(payload, quote);
+      if (legacySaved.length > 0) return legacySaved;
     }
 
     // New endpoint: { buy: [{ rate }], sell: [{ rate }] } (usually USD/UZS bank rates)
@@ -114,34 +101,82 @@ export class CurrencyService {
     throw new Error("Unsupported rate API payload format");
   }
 
-  async pullCbuRates(apiUrl = "https://cbu.uz/uz/arkhiv-kursov-valyut/json/"): Promise<CurrencyRate[]> {
+  async pullCbuRates(apiUrl = DEFAULT_CBU_RATES_URL): Promise<CurrencyRate[]> {
     const response = await fetch(apiUrl);
     if (!response.ok) {
       throw new Error(`Failed to fetch rates from CBU (${response.status} ${response.statusText})`);
     }
 
     const payload = (await response.json()) as { Ccy: string; Rate: string; Date: string; Nominal?: string }[];
+    return this.saveCbuPayload(payload);
+  }
+
+  async listAllRates(): Promise<CurrencyRate[]> {
+    return this.repository.find({ order: { base: "ASC" } });
+  }
+
+  private async saveLegacyPayload(payload: unknown[], quote: string): Promise<CurrencyRate[]> {
     const saved: CurrencyRate[] = [];
 
     for (const item of payload) {
-      const base = item.Ccy?.toUpperCase();
-      if (!base) continue;
+      if (!item || typeof item !== "object") continue;
+      if (!("name" in item) || !("kurs" in item)) continue;
 
-      const nominal = item.Nominal ? Number(item.Nominal.replace(/\s/g, "")) : 1;
-      const rateNumber = Number(item.Rate.replace(/\s/g, ""));
-      if (!Number.isFinite(rateNumber) || nominal <= 0) continue;
+      const rawName = (item as { name?: unknown }).name;
+      const rawKurs = (item as { kurs?: unknown }).kurs;
+      if (typeof rawName !== "string") continue;
 
-      const perUnit = rateNumber / nominal;
-      const date = parseCbuDate(item.Date);
-      const stored = await this.upsertRate(base, "UZS", perUnit.toFixed(6), date ?? undefined);
+      const cleanName = decodeHtml(rawName);
+      const match = cleanName.match(/^(\d+)\s+(.+)$/);
+      const amount = match ? Number(match[1]) : 1;
+      const labelRaw = match ? match[2] : cleanName;
+      const label = labelRaw.replace(/\s+/g, " ").trim();
+
+      const base = mapNameToCode(label);
+      if (!base) {
+        console.warn(`Unknown currency label skipped: ${label}`);
+        continue;
+      }
+
+      const numeric = parseRateNumber(rawKurs);
+      if (!Number.isFinite(numeric) || amount <= 0) {
+        console.warn(`Invalid rate skipped for ${label} (${String(rawKurs)})`);
+        continue;
+      }
+
+      const ratePerUnit = numeric / amount;
+      const stored = await this.upsertRate(base, quote, ratePerUnit.toFixed(6));
       saved.push(stored);
     }
 
     return saved;
   }
 
-  async listAllRates(): Promise<CurrencyRate[]> {
-    return this.repository.find({ order: { base: "ASC" } });
+  private async saveCbuPayload(payload: unknown): Promise<CurrencyRate[]> {
+    if (!Array.isArray(payload)) return [];
+
+    const saved: CurrencyRate[] = [];
+
+    for (const item of payload) {
+      if (!item || typeof item !== "object") continue;
+      const cbuItem = item as { Ccy?: unknown; Rate?: unknown; Date?: unknown; Nominal?: unknown };
+      if (typeof cbuItem.Ccy !== "string" || typeof cbuItem.Rate !== "string") continue;
+
+      const base = cbuItem.Ccy.toUpperCase();
+      if (!base) continue;
+
+      const nominalValue = typeof cbuItem.Nominal === "string" ? cbuItem.Nominal : "1";
+      const nominal = Number(nominalValue.replace(/\s/g, ""));
+      const rateNumber = Number(cbuItem.Rate.replace(/\s/g, ""));
+      if (!Number.isFinite(rateNumber) || nominal <= 0) continue;
+
+      const perUnit = rateNumber / nominal;
+      const sourceDate = typeof cbuItem.Date === "string" ? parseCbuDate(cbuItem.Date) : null;
+      const stored = await this.upsertRate(base, "UZS", perUnit.toFixed(6), sourceDate ?? undefined);
+      saved.push(stored);
+    }
+
+    return saved;
   }
 }
 

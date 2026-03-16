@@ -16,8 +16,28 @@ const bootstrap = async (): Promise<void> => {
   const currencyService = new CurrencyService(appDataSource.getRepository(CurrencyRate));
   const alertRepository = appDataSource.getRepository(RateAlert);
   const paymentRepository = appDataSource.getRepository(Payment);
-  await currencyService.pullLatestRates(env.rateApiUrl);
-  console.log("Initial rates synced from remote API");
+
+  let rateSyncRunning = false;
+  const syncRates = async (reason: string): Promise<void> => {
+    if (rateSyncRunning) return;
+    rateSyncRunning = true;
+    try {
+      const saved = await currencyService.syncRates(env.rateApiUrl);
+      console.log(`Rates synced (${reason})`, { count: saved.length });
+    } finally {
+      rateSyncRunning = false;
+    }
+  };
+
+  await syncRates("startup");
+
+  if (Number.isFinite(env.rateSyncIntervalMs) && env.rateSyncIntervalMs > 0) {
+    const intervalHandle = setInterval(() => {
+      void syncRates("interval").catch((error) => console.error("Periodic rate sync failed", error));
+    }, env.rateSyncIntervalMs);
+    intervalHandle.unref();
+  }
+
   const bot = createBot(env.botToken, { userRepository, currencyService, alertRepository, paymentRepository });
   const webhookServer = startWebhookServer(env.webhookPort, {
     bot,

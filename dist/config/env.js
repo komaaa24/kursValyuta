@@ -104,5 +104,6 @@ exports.env = {
     adminIds: parseNumberList(process.env.ADMIN_IDS ?? process.env.OPERATOR_CHAT_ID),
     webhookPort: numberEnv(process.env.WEBHOOK_PORT ?? process.env.PORT ?? "3000", 3000),
     alertCheckIntervalMs: numberEnv(process.env.ALERT_CHECK_INTERVAL_MS ?? "300000", 300000),
+    rateSyncIntervalMs: numberEnv(process.env.RATE_SYNC_INTERVAL_MS ?? "3600000", 3600000),
 };
 //# sourceMappingURL=env.js.map

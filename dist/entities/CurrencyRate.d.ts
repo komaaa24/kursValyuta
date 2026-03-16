@@ -3,6 +3,7 @@ export declare class CurrencyRate {
     base: string;
     quote: string;
     rate: string;
+    sourceDate: Date | null;
     createdAt: Date;
     updatedAt: Date;
 }

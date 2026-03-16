@@ -146,6 +146,8 @@ const safeEditMessageText = async (
   }
 };
 
+const getRateDisplayDate = (rate: { sourceDate?: Date | null; updatedAt: Date }): Date => rate.sourceDate ?? rate.updatedAt;
+
 export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
   const bot = new Bot<Context>(token);
   const userState = new Map<number, UserState>();
@@ -486,14 +488,14 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
   const getRateSnapshot = async (
     base: string,
     quote: string,
-  ): Promise<{ latest: number; previous: number | null; updatedAt: Date } | null> => {
+  ): Promise<{ latest: number; previous: number | null; displayDate: Date } | null> => {
     // Try direct
     const direct = await deps.currencyService.getLatestAndPrevious(base, quote);
     if (direct.latest) {
       return {
         latest: Number(direct.latest.rate),
         previous: direct.previous ? Number(direct.previous.rate) : null,
-        updatedAt: direct.latest.updatedAt,
+        displayDate: getRateDisplayDate(direct.latest),
       };
     }
     // Try inverse if direct absent
@@ -501,12 +503,20 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
     if (inverse.latest && Number(inverse.latest.rate) !== 0) {
       const latestVal = 1 / Number(inverse.latest.rate);
       const prevVal = inverse.previous ? 1 / Number(inverse.previous.rate) : null;
-      return { latest: latestVal, previous: prevVal, updatedAt: inverse.latest.updatedAt };
+      return { latest: latestVal, previous: prevVal, displayDate: getRateDisplayDate(inverse.latest) };
     }
     return null;
   };
 
-  const sendRatesList = async (ctx: Context, opts?: { edit?: boolean; offset?: number }) => {
+  const sendRatesList = async (ctx: Context, opts?: { edit?: boolean; offset?: number; refresh?: boolean }) => {
+    if (opts?.refresh) {
+      try {
+        await deps.currencyService.syncRates(env.rateApiUrl);
+      } catch (error) {
+        console.error("Rates refresh failed", error);
+      }
+    }
+
     const rates = await deps.currencyService.listAllRates();
     if (!rates.length) {
       if (opts?.edit) {
@@ -517,9 +527,12 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
       return;
     }
 
-    const latestUpdated = rates.reduce<Date | null>((acc, r) => (!acc || r.updatedAt > acc ? r.updatedAt : acc), null);
-    const header = `📊 Markaziy bank kurslari (1 birlik) — 📅 ${latestUpdated ? formatDate(latestUpdated) : "—"} | 🕒 ${
-      latestUpdated ? formatTimeAgo(latestUpdated) : "—"
+    const latestDisplayDate = rates.reduce<Date | null>((acc, rate) => {
+      const current = getRateDisplayDate(rate);
+      return !acc || current > acc ? current : acc;
+    }, null);
+    const header = `📊 Markaziy bank kurslari (1 birlik) — 📅 ${latestDisplayDate ? formatDate(latestDisplayDate) : "—"} | 🕒 ${
+      latestDisplayDate ? formatTimeAgo(latestDisplayDate) : "—"
     }`;
 
     const priority = ["USD", "RUB", "EUR", "CNY", "GBP", "JPY", "AED", "TRY", "KZT", "UZS"];
@@ -626,12 +639,12 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
       if (!alerts.length) return;
 
       try {
-        await deps.currencyService.pullLatestRates(env.rateApiUrl);
+        await deps.currencyService.syncRates(env.rateApiUrl);
       } catch (error) {
         console.error("Alert rate sync failed", error);
       }
 
-      const rateCache = new Map<string, { rate: number; updatedAt: Date } | null>();
+      const rateCache = new Map<string, { rate: number; displayDate: Date } | null>();
       const userCache = new Map<number, User | null>();
 
       const getRateInfo = async (base: string, quote: string) => {
@@ -647,7 +660,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
           rateCache.set(key, null);
           return null;
         }
-        const info = { rate: rateValue, updatedAt: latest.updatedAt };
+        const info = { rate: rateValue, displayDate: getRateDisplayDate(latest) };
         rateCache.set(key, info);
         return info;
       };
@@ -679,7 +692,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
           `Maqsad: ${formatRate(targetValue)} ${alert.quote}`,
           `Joriy: ${formatRate(rateInfo.rate)} ${alert.quote}`,
           `Holat: kurs ${directionText}`,
-          `📅 Sana: ${formatDate(rateInfo.updatedAt)} | 🕒 ${formatTimeAgo(rateInfo.updatedAt)}`,
+          `📅 Sana: ${formatDate(rateInfo.displayDate)} | 🕒 ${formatTimeAgo(rateInfo.displayDate)}`,
         ].join("\n");
 
         try {
@@ -820,7 +833,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
       return;
     }
     if (normalized === "📊 kurslar" || normalized === "kurslar") {
-      await sendRatesList(ctx);
+      await sendRatesList(ctx, { refresh: true });
       return;
     }
     if (normalized === "⭐ pro" || normalized === "pro") {
@@ -865,7 +878,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
         `${flagFor(base)} ${formatAmount(amount)} ${base} ➝ ${flagFor(quote)} ${formatAmount(converted)} ${quote}`,
         inverse ? `1 ${quote} = ${formatRate(inverse)} ${base}` : `1 ${base} = ${formatRate(rate)} ${quote}`,
         delta !== null ? `O'zgarish: ${formatDelta(delta)} ${trendEmoji(delta)}` : undefined,
-        `📅 Sana: ${formatDate(snap.updatedAt)} | 🕒 ${formatTimeAgo(snap.updatedAt)}`,
+        `📅 Sana: ${formatDate(snap.displayDate)} | 🕒 ${formatTimeAgo(snap.displayDate)}`,
       ]
         .filter(Boolean)
         .join("\n");
@@ -936,7 +949,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
         `${flagFor(alert.base)} ${alert.base} → ${alert.quote}`,
         `Shart: kurs ${directionHint} ${formatRate(parsed.target)} ${alert.quote}`,
         `Joriy: ${formatRate(snap.latest)} ${alert.quote}`,
-        `📅 Sana: ${formatDate(snap.updatedAt)} | 🕒 ${formatTimeAgo(snap.updatedAt)}`,
+        `📅 Sana: ${formatDate(snap.displayDate)} | 🕒 ${formatTimeAgo(snap.displayDate)}`,
         "Alert ishlaganda xabar yuboramiz.",
       ].join("\n");
       await ctx.reply(confirmation, { reply_markup: alertsKeyboard() });
@@ -964,7 +977,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
       `${flagFor("USD")} ${formatAmount(usdAmount)} USD ➝ ${flagFor("UZS")} ${formatAmount(converted)} UZS`,
       `📊 Kurs: ${formatRate(rate)} UZS`,
       delta !== null ? `O'zgarish: ${formatDelta(delta)} ${trendEmoji(delta)}` : undefined,
-      `📅 Sana: ${formatDate(snap.updatedAt)} | 🕒 ${formatTimeAgo(snap.updatedAt)}`,
+      `📅 Sana: ${formatDate(snap.displayDate)} | 🕒 ${formatTimeAgo(snap.displayDate)}`,
       "Yo'nalishni o'zgartirish uchun \"Konvertatsiya\" tugmasini bosing.",
     ]
       .filter(Boolean)
@@ -999,7 +1012,7 @@ export const createBot = (token: string, deps: Dependencies): Bot<Context> => {
           } else if (value === "convert") {
             await safeEditMessageText(ctx, "Qaysi yo'nalishda?", { reply_markup: convertPairKeyboard() });
           } else if (value === "rates") {
-            await sendRatesList(ctx, { edit: true });
+            await sendRatesList(ctx, { edit: true, refresh: true });
           } else if (value === "alerts") {
             const hasAccess = await ensureProAccess(ctx, { edit: true });
             if (!hasAccess) return;

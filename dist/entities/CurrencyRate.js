@@ -31,6 +31,10 @@ __decorate([
     __metadata("design:type", String)
 ], CurrencyRate.prototype, "rate", void 0);
 __decorate([
+    (0, typeorm_1.Column)({ type: "timestamp with time zone", nullable: true }),
+    __metadata("design:type", Object)
+], CurrencyRate.prototype, "sourceDate", void 0);
+__decorate([
     (0, typeorm_1.CreateDateColumn)({ type: "timestamp with time zone" }),
     __metadata("design:type", Date)
 ], CurrencyRate.prototype, "createdAt", void 0);

@@ -13,7 +13,7 @@ Telegram valyuta kursi boti. Stack: Node.js, TypeScript, [grammy](https://grammy
 - `BOT_TOKEN` - Telegram bot token.
 - `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_NAME` - PostgreSQL ulanish ma'lumotlari.
 - `SHERLAR_DB_HOST`, `SHERLAR_DB_PORT`, `SHERLAR_DB_USERNAME`, `SHERLAR_DB_PASSWORD`, `SHERLAR_DB_NAME` - tashqi sherlar DB (ixtiyoriy, to'lovni tekshirish uchun).
-- `RATE_API_URL` - valyuta API endpointi (`http://94.158.52.192/kurs/test.php`).
+- `RATE_API_URL` - ixtiyoriy fallback valyuta API endpointi (`http://94.158.52.192/kurs/test.php`). Bot avval CBU API ni sinab ko'radi.
 - `PRO_PAYMENT_URL` - PRO obuna uchun to'lov sahifasi URL'i.
 - `PRO_PRICE` - PRO obuna narxi (so'm).
 - `PRO_DURATION_DAYS` - PRO muddati (kun). 0 yoki manfiy bo'lsa cheksiz.
@@ -30,6 +30,7 @@ Telegram valyuta kursi boti. Stack: Node.js, TypeScript, [grammy](https://grammy
 - `LEGACY_WEBHOOK_TOKEN` - `/webhook/pay` uchun maxfiy token (x-webhook-token yoki Bearer).
 - `WEBHOOK_PORT` - Click webhook server porti (default: 3000).
 - `ALERT_CHECK_INTERVAL_MS` - kurs alertlarini tekshirish oraliqi (ms).
+- `RATE_SYNC_INTERVAL_MS` - kurslarni fon rejimida qayta sync qilish oraliqi (ms), default: 3600000.
 - `ADMIN_IDS` - admin Telegram ID'lar (vergul bilan ajratib yozing).
 
 ## Click webhook
@@ -47,7 +48,7 @@ Click server webhook manzili:
 - `src/entities` - TypeORM entitetlari (`User`, `CurrencyRate`).
 - `src/services/currencyService.ts` - kurs bilan ishlash logikasi (CRUD, API dan pull qilish).
 
-Bot start bo'lganda `RATE_API_URL` dan kurslarni olib `UZS` ga nisbatan DB ga saqlab qo'yadi.
+Bot start bo'lganda avval CBU (`cbu.uz`) API dan kurslarni olib `UZS` ga nisbatan DB ga saqlaydi. Agar bu manba ishlamasa, `RATE_API_URL` fallback sifatida ishlatiladi. Shundan keyin kurslar fon rejimida periodik ravishda qayta sync qilinadi.
 
 Botdagi asosiy buyruqlar:
 - `/rate USD [UZS]` — juftlik kursi (UZS default).

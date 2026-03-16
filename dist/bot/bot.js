@@ -90,6 +90,7 @@ const safeEditMessageText = async (ctx, text, options) => {
         throw error;
     }
 };
+const getRateDisplayDate = (rate) => rate.sourceDate ?? rate.updatedAt;
 const createBot = (token, deps) => {
     const bot = new grammy_1.Bot(token);
     const userState = new Map();
@@ -403,7 +404,7 @@ const createBot = (token, deps) => {
             return {
                 latest: Number(direct.latest.rate),
                 previous: direct.previous ? Number(direct.previous.rate) : null,
-                updatedAt: direct.latest.updatedAt,
+                displayDate: getRateDisplayDate(direct.latest),
             };
         }
         // Try inverse if direct absent
@@ -411,7 +412,7 @@ const createBot = (token, deps) => {
         if (inverse.latest && Number(inverse.latest.rate) !== 0) {
             const latestVal = 1 / Number(inverse.latest.rate);
             const prevVal = inverse.previous ? 1 / Number(inverse.previous.rate) : null;
-            return { latest: latestVal, previous: prevVal, updatedAt: inverse.latest.updatedAt };
+            return { latest: latestVal, previous: prevVal, displayDate: getRateDisplayDate(inverse.latest) };
         }
         return null;
     };
@@ -426,8 +427,11 @@ const createBot = (token, deps) => {
             }
             return;
         }
-        const latestUpdated = rates.reduce((acc, r) => (!acc || r.updatedAt > acc ? r.updatedAt : acc), null);
-        const header = `📊 Markaziy bank kurslari (1 birlik) — 📅 ${latestUpdated ? formatDate(latestUpdated) : "—"} | 🕒 ${latestUpdated ? formatTimeAgo(latestUpdated) : "—"}`;
+        const latestDisplayDate = rates.reduce((acc, rate) => {
+            const current = getRateDisplayDate(rate);
+            return !acc || current > acc ? current : acc;
+        }, null);
+        const header = `📊 Markaziy bank kurslari (1 birlik) — 📅 ${latestDisplayDate ? formatDate(latestDisplayDate) : "—"} | 🕒 ${latestDisplayDate ? formatTimeAgo(latestDisplayDate) : "—"}`;
         const priority = ["USD", "RUB", "EUR", "CNY", "GBP", "JPY", "AED", "TRY", "KZT", "UZS"];
         const sorted = rates
             .slice()
@@ -529,7 +533,7 @@ const createBot = (token, deps) => {
             if (!alerts.length)
                 return;
             try {
-                await deps.currencyService.pullLatestRates(env_1.env.rateApiUrl);
+                await deps.currencyService.syncRates(env_1.env.rateApiUrl);
             }
             catch (error) {
                 console.error("Alert rate sync failed", error);
@@ -550,7 +554,7 @@ const createBot = (token, deps) => {
                     rateCache.set(key, null);
                     return null;
                 }
-                const info = { rate: rateValue, updatedAt: latest.updatedAt };
+                const info = { rate: rateValue, displayDate: getRateDisplayDate(latest) };
                 rateCache.set(key, info);
                 return info;
             };
@@ -581,7 +585,7 @@ const createBot = (token, deps) => {
                     `Maqsad: ${formatRate(targetValue)} ${alert.quote}`,
                     `Joriy: ${formatRate(rateInfo.rate)} ${alert.quote}`,
                     `Holat: kurs ${directionText}`,
-                    `📅 Sana: ${formatDate(rateInfo.updatedAt)} | 🕒 ${formatTimeAgo(rateInfo.updatedAt)}`,
+                    `📅 Sana: ${formatDate(rateInfo.displayDate)} | 🕒 ${formatTimeAgo(rateInfo.displayDate)}`,
                 ].join("\n");
                 try {
                     await bot.api.sendMessage(Number(alert.telegramId), message);
@@ -756,7 +760,7 @@ const createBot = (token, deps) => {
                 `${flagFor(base)} ${formatAmount(amount)} ${base} ➝ ${flagFor(quote)} ${formatAmount(converted)} ${quote}`,
                 inverse ? `1 ${quote} = ${formatRate(inverse)} ${base}` : `1 ${base} = ${formatRate(rate)} ${quote}`,
                 delta !== null ? `O'zgarish: ${formatDelta(delta)} ${trendEmoji(delta)}` : undefined,
-                `📅 Sana: ${formatDate(snap.updatedAt)} | 🕒 ${formatTimeAgo(snap.updatedAt)}`,
+                `📅 Sana: ${formatDate(snap.displayDate)} | 🕒 ${formatTimeAgo(snap.displayDate)}`,
             ]
                 .filter(Boolean)
                 .join("\n");
@@ -821,7 +825,7 @@ const createBot = (token, deps) => {
                 `${flagFor(alert.base)} ${alert.base} → ${alert.quote}`,
                 `Shart: kurs ${directionHint} ${formatRate(parsed.target)} ${alert.quote}`,
                 `Joriy: ${formatRate(snap.latest)} ${alert.quote}`,
-                `📅 Sana: ${formatDate(snap.updatedAt)} | 🕒 ${formatTimeAgo(snap.updatedAt)}`,
+                `📅 Sana: ${formatDate(snap.displayDate)} | 🕒 ${formatTimeAgo(snap.displayDate)}`,
                 "Alert ishlaganda xabar yuboramiz.",
             ].join("\n");
             await ctx.reply(confirmation, { reply_markup: alertsKeyboard() });
@@ -847,7 +851,7 @@ const createBot = (token, deps) => {
             `${flagFor("USD")} ${formatAmount(usdAmount)} USD ➝ ${flagFor("UZS")} ${formatAmount(converted)} UZS`,
             `📊 Kurs: ${formatRate(rate)} UZS`,
             delta !== null ? `O'zgarish: ${formatDelta(delta)} ${trendEmoji(delta)}` : undefined,
-            `📅 Sana: ${formatDate(snap.updatedAt)} | 🕒 ${formatTimeAgo(snap.updatedAt)}`,
+            `📅 Sana: ${formatDate(snap.displayDate)} | 🕒 ${formatTimeAgo(snap.displayDate)}`,
             "Yo'nalishni o'zgartirish uchun \"Konvertatsiya\" tugmasini bosing.",
         ]
             .filter(Boolean)

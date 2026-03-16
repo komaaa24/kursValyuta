@@ -36,5 +36,6 @@ export declare const env: {
     adminIds: number[];
     webhookPort: number;
     alertCheckIntervalMs: number;
+    rateSyncIntervalMs: number;
 };
 //# sourceMappingURL=env.d.ts.map
